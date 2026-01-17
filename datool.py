@@ -1758,41 +1758,25 @@ def _collect_commit_stats(
     repo: Repo,
     students_config: StudentsConfig,
     ignored_authors: set[Author],
-    include_patterns: list[str],
-    exclude_patterns: list[str],
+    file_commits: dict[str, set[str]],
     coauthors_cache: dict[str, list[Author]],
 ) -> tuple[CommitsData, CommitsData]:
-    """Collect commit statistics."""
-    from fnmatch import fnmatch
+    """Collect commit statistics.
 
+    Uses the commits found by git blame (in file_commits) to ensure consistency
+    with line statistics. This means commits that introduced code via copy/move
+    (detected by git blame -C -C) are counted even if they didn't directly
+    modify matching files.
+    """
     alone_commits: CommitsData = {s: set() for s in students_config.students}
     collab_commits: CommitsData = {s: set() for s in students_config.students}
 
-    def matches_include(file_path: str) -> bool:
-        for pattern in include_patterns:
-            if fnmatch(file_path, pattern):
-                return True
-        return False
+    # Collect unique commits from all files
+    all_commits: set[str] = set()
+    for commits in file_commits.values():
+        all_commits.update(commits)
 
-    def should_exclude(file_path: str) -> bool:
-        for pattern in exclude_patterns:
-            if fnmatch(file_path, pattern):
-                return True
-        return False
-
-    for commit_hash, files in repo.get_all_commits():
-        matching_files = [
-            f for f in files if matches_include(f) and not should_exclude(f)
-        ]
-        if not matching_files:
-            continue
-
-        # Check if commit has non-whitespace changes to any matching file
-        non_ws_files = repo.get_commit_non_whitespace_files(commit_hash)
-        has_non_ws_changes = any(f in non_ws_files for f in matching_files)
-        if not has_non_ws_changes:
-            continue
-
+    for commit_hash in all_commits:
         try:
             commit = repo.get_commit(commit_hash)
         except (CommitNotFoundError, UnknownAuthorError):
@@ -2256,13 +2240,12 @@ def main() -> None:
             repo, students_config, ignored_authors, include_patterns, exclude_patterns
         )
 
-        # Collect commit stats
+        # Collect commit stats (uses commits found by line stats for consistency)
         alone_commits, collab_commits = _collect_commit_stats(
             repo,
             students_config,
             ignored_authors,
-            include_patterns,
-            exclude_patterns,
+            file_commits,
             coauthors_cache,
         )
 
