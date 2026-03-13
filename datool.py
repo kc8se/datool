@@ -525,12 +525,16 @@ class Commit:
         Follows GitHub's format for commits with multiple authors:
         https://docs.github.com/en/pull-requests/committing-changes-to-your-project/creating-and-editing-commits/creating-a-commit-with-multiple-authors
 
-        The format is: Co-authored-by: name <email>
+        Parsing strategy (LINE = META NAME MAIL):
+        - META: line must start with "co-authored" optionally followed by "-by",
+          then any mix of colon and whitespace.
+        - MAIL: the rightmost token matching [a-z0-9._-]+@[a-z0-9-]+(\.[a-z0-9-]+)*
+          (case-insensitive) anywhere on the line.
+        - NAME: from the text after META with MAIL removed, the first run of
+          [a-z0-9 -]+ characters, with multiple spaces collapsed and edges trimmed.
 
-        This method is forgiving and tries multiple patterns:
-        1. Precise: Co-authored-by: Name <email@example.com>
-        2. Without angle brackets: Co-authored-by: Name email@example.com
-        3. Loose: co-authored[-by] Name email@example.com (no colon required)
+        This is intentionally forgiving: extra characters around the email (angle
+        brackets, punctuation) or extra spaces in the name are silently ignored.
 
         Returns:
             List of Author instances parsed from Co-authored-by lines, or empty list
@@ -539,45 +543,43 @@ class Commit:
 
         co_authors: list[Author] = []
 
-        # Pattern 1: Precise - Co-authored-by: Name <email@example.com>
-        precise_pattern = re.compile(
-            r"^Co-authored-by:\s*(.+?)\s*<([^>]+)>\s*$", re.IGNORECASE
+        # META: "co-authored" optionally "-by", then any colon/whitespace
+        meta_re = re.compile(r"^co-authored(?:-by)?[:\s]*", re.IGNORECASE)
+
+        # MAIL: standard-ish email token
+        mail_re = re.compile(
+            r"[a-z0-9._\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*", re.IGNORECASE
         )
 
-        # Pattern 2: Without brackets - Co-authored-by: Name email@example.com
-        no_brackets_pattern = re.compile(
-            r"^Co-authored-by:\s*(.+?)\s+(\S+@\S+)\s*$", re.IGNORECASE
-        )
-
-        # Pattern 3: Loose - co-authored[-by] Name email (word starts with "co-authored")
-        loose_pattern = re.compile(
-            r"^co-authored(?:-by)?[:\s]+(.+?)\s+(\S+@\S+)\s*$", re.IGNORECASE
-        )
+        # NAME: first run of name-safe characters (letters, digits, space, hyphen)
+        name_re = re.compile(r"[a-z0-9][a-z0-9 \-]*", re.IGNORECASE)
 
         for line in self.message_lines:
             stripped = line.strip()
-            name: str | None = None
-            email: str | None = None
 
-            # Try patterns in order of precision
-            match = precise_pattern.match(stripped)
-            if match:
-                name = match.group(1).strip()
-                email = match.group(2).strip()
-            else:
-                match = no_brackets_pattern.match(stripped)
-                if match:
-                    name = match.group(1).strip()
-                    email = match.group(2).strip()
-                else:
-                    match = loose_pattern.match(stripped)
-                    if match:
-                        name = match.group(1).strip()
-                        email = match.group(2).strip()
+            meta_match = meta_re.match(stripped)
+            if not meta_match:
+                continue
+
+            # Find the rightmost valid email on the line
+            mail_matches = list(mail_re.finditer(stripped))
+            if not mail_matches:
+                continue
+            mail_match = mail_matches[-1]
+            email = mail_match.group(0)
+
+            # Extract name from the part after META, with the email span removed
+            after_meta = stripped[meta_match.end():]
+            mail_start = mail_match.start() - meta_match.end()
+            mail_end = mail_match.end() - meta_match.end()
+            name_source = after_meta[:mail_start] + after_meta[mail_end:]
+
+            name_match = name_re.search(name_source)
+            if not name_match:
+                continue
+            name = re.sub(r" {2,}", " ", name_match.group(0)).strip()
 
             if name and email:
-                # Clean up email if it has stray angle brackets
-                email = email.strip("<>")
                 co_authors.append(
                     Author.get(
                         name=name,
