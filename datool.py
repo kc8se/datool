@@ -569,7 +569,7 @@ class Commit:
             email = mail_match.group(0)
 
             # Extract name from the part after META, with the email span removed
-            after_meta = stripped[meta_match.end():]
+            after_meta = stripped[meta_match.end() :]
             mail_start = mail_match.start() - meta_match.end()
             mail_end = mail_match.end() - meta_match.end()
             name_source = after_meta[:mail_start] + after_meta[mail_end:]
@@ -792,6 +792,7 @@ class Repo:
         self.path = Path(path).resolve()
         self._students_config_path = None
         self._repo_id = None
+        self._pull_requests: list[PullRequest] | None = None
 
         # Verify this is a valid git repository
         if not self.path.exists():
@@ -1128,33 +1129,10 @@ class Repo:
                 ValueError,
                 UnknownAuthorError,
             ):
-                # Fall back to GitHub data if local git fails
-                authors = commit_data.get("authors", [])
-                if authors:
-                    primary_author = authors[0]
-                    author_username = primary_author.get("login", "")
-                    author_email = primary_author.get("email", "")
-                    co_authors = [
-                        a.get("login", "") for a in authors[1:] if a.get("login")
-                    ]
-                else:
-                    author_username = ""
-                    author_email = ""
-                    co_authors = []
-
-                commits.append(
-                    PullRequestCommit(
-                        hash=commit_hash,
-                        author_username=author_username,
-                        author_email=author_email,
-                        message=commit_data.get("messageHeadline", ""),
-                        date=(
-                            commit_data.get("authoredDate", "")[:10]
-                            if commit_data.get("authoredDate")
-                            else ""
-                        ),
-                        co_authors=co_authors,
-                    )
+                # Commit not found in local git — skip it to keep output consistent
+                print(
+                    f"Warning: commit {commit_hash[:7]} not found locally, skipping",
+                    file=sys.stderr,
                 )
 
         return commits
@@ -1173,6 +1151,9 @@ class Repo:
         Raises:
             GitHubApiError: If the gh command fails
         """
+        if self._pull_requests is not None:
+            return self._pull_requests
+
         global _pr_cache, _cache_dirty
 
         # Check if gh is available
@@ -1235,6 +1216,7 @@ class Repo:
                     _pr_cache[(repo_key, pr.number)] = pr
                     _cache_dirty = True
 
+        self._pull_requests = pull_requests
         return pull_requests
 
     def _fetch_pr_details(
@@ -2108,6 +2090,54 @@ def _init_user_templates(user_templates_dir: Path) -> None:
     print("After customizing, run 'datool --init <repo>' again to initialize a repo.")
 
 
+def _annotate_pr(repo: Repo, pr_number: int, pull_requests: list[PullRequest]) -> None:
+    """
+    Post or update a participation classification comment on a specific PR.
+
+    Uses --edit-last to update the comment on repeated runs rather than
+    creating duplicates. Falls back to creating a new comment if none exists.
+    """
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        return
+
+    pr = next((p for p in pull_requests if p.number == pr_number), None)
+    if pr is None:
+        print(f"Warning: PR #{pr_number} not found", file=sys.stderr)
+        return
+
+    is_collab = any(commit.co_authors for commit in pr.commits)
+    if is_collab:
+        classification = "**collaborative** work (has commits with co-authors)"
+    else:
+        classification = "**solo** work (no commits with co-authors)"
+
+    lines = [f"**datool participation:** This PR is classified as {classification}.", ""]
+    lines.append("| Commit | Collaborators | Message |")
+    lines.append("|--------|---------------|---------|")
+    for commit in pr.commits:
+        short_hash = commit.hash[:7]
+        collaborators = ", ".join(commit.co_authors) if commit.co_authors else "—"
+        msg = commit.message.splitlines()[0][:40] if commit.message else ""
+        lines.append(f"| `{short_hash}` | {collaborators} | {msg} |")
+
+    body = "\n".join(lines)
+
+    # Try to edit the last comment to avoid duplicates on repeated runs
+    result = subprocess.run(
+        [gh_path, "pr", "comment", str(pr_number), "--edit-last", "--body", body],
+        cwd=repo.path,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        # No existing comment by this user — create a new one
+        subprocess.run(
+            [gh_path, "pr", "comment", str(pr_number), "--body", body],
+            cwd=repo.path,
+            capture_output=True,
+        )
+
+
 def fetch_readme() -> str:
     """
     Fetch the README.md from the GitHub repository.
@@ -2139,13 +2169,11 @@ def fetch_readme() -> str:
             content = response.read().decode("utf-8")
     except urllib.error.URLError as e:
         raise ConnectionError(
-            f"Could not fetch README. Are you connected to the internet?\n"
-            f"Details: {e}"
+            f"Could not fetch README. Are you connected to the internet?\nDetails: {e}"
         ) from e
     except Exception as e:
         raise ConnectionError(
-            f"Could not fetch README. Are you connected to the internet?\n"
-            f"Details: {e}"
+            f"Could not fetch README. Are you connected to the internet?\nDetails: {e}"
         ) from e
 
     # Cache the result
@@ -2197,6 +2225,12 @@ def main() -> None:
         "--init",
         action="store_true",
         help="Initialize repo with GitHub Actions workflow and datool script",
+    )
+    parser.add_argument(
+        "--annotate-pr",
+        type=int,
+        metavar="PR",
+        help="Post a participation classification comment on this PR number (implies --github)",
     )
     parser.add_argument(
         "--readme",
@@ -2269,6 +2303,10 @@ def main() -> None:
 
         _print_summary(students_config, result, include_patterns, exclude_patterns)
         _print_file_details(repo, students_config, result)
+
+        if args.annotate_pr:
+            pull_requests = repo.get_pull_requests()
+            _annotate_pr(repo, args.annotate_pr, pull_requests)
 
     except (
         ValueError,

@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
 
     steps:
       - name: Checkout repository
@@ -30,7 +30,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -o pipefail
-          python .github/scripts/datool.py --github . | tee stats.txt
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          ANNOTATE_FLAG=""
+          if [ -n "$PR_NUMBER" ]; then ANNOTATE_FLAG="--annotate-pr $PR_NUMBER"; fi
+          python .github/scripts/datool.py --github $ANNOTATE_FLAG . | tee stats.txt
           echo "## Participation Stats" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat stats.txt >> $GITHUB_STEP_SUMMARY
