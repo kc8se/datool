@@ -999,14 +999,18 @@ class Repo:
 
         # Check if we have a cached path that still works
         if self._students_config_path:
+            config_file = self.path / self._students_config_path
             try:
-                config_file = self.path / self._students_config_path
                 if config_file.exists():
                     with open(config_file, "r", encoding="utf-8") as f:
                         cached_data: dict[str, Any] = json.load(f)
                     if cached_data.get("id") == magic_id:
                         return cached_data
-            except (json.JSONDecodeError, OSError):
+            except json.JSONDecodeError as e:
+                raise StudentsConfigError(
+                    f"Students config file has invalid JSON: {config_file}\n{e}"
+                )
+            except OSError:
                 pass
             # Cached path no longer valid, clear it
             self._students_config_path = None
@@ -1022,8 +1026,19 @@ class Repo:
                     self._students_config_path = str(config_file.relative_to(self.path))
                     return data
 
-            except (json.JSONDecodeError, OSError, TypeError):
-                # Not a valid JSON file or not a dict, skip it
+            except json.JSONDecodeError as e:
+                try:
+                    raw = config_file.read_text(encoding="utf-8", errors="replace")
+                    if magic_id in raw:
+                        raise StudentsConfigError(
+                            f"Students config file has invalid JSON: {config_file}\n{e}"
+                        )
+                except StudentsConfigError:
+                    raise
+                except OSError:
+                    pass
+                continue
+            except (OSError, TypeError):
                 continue
 
         # Also check hidden .json files
@@ -1037,8 +1052,19 @@ class Repo:
                     self._students_config_path = str(config_file.relative_to(self.path))
                     return data2
 
-            except (json.JSONDecodeError, OSError, TypeError):
-                # Not a valid JSON file or not a dict, skip it
+            except json.JSONDecodeError as e:
+                try:
+                    raw = config_file.read_text(encoding="utf-8", errors="replace")
+                    if magic_id in raw:
+                        raise StudentsConfigError(
+                            f"Students config file has invalid JSON: {config_file}\n{e}"
+                        )
+                except StudentsConfigError:
+                    raise
+                except OSError:
+                    pass
+                continue
+            except (OSError, TypeError):
                 continue
 
         return None
@@ -2090,7 +2116,34 @@ def _init_user_templates(user_templates_dir: Path) -> None:
     print("After customizing, run 'datool --init <repo>' again to initialize a repo.")
 
 
-def _annotate_pr(repo: Repo, pr_number: int, pull_requests: list[PullRequest]) -> None:
+def _post_error_to_pr(repo: "Repo", pr_number: int, error_message: str) -> None:
+    """Post or update an error comment on a PR using the same edit-last mechanism."""
+    gh_path = shutil.which("gh")
+    if not gh_path:
+        return
+
+    body = f"**datool error:** {error_message}"
+
+    result = subprocess.run(
+        [gh_path, "pr", "comment", str(pr_number), "--edit-last", "--body", body],
+        cwd=repo.path,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        subprocess.run(
+            [gh_path, "pr", "comment", str(pr_number), "--body", body],
+            cwd=repo.path,
+            capture_output=True,
+        )
+
+
+def _annotate_pr(
+    repo: Repo,
+    pr_number: int,
+    pull_requests: list[PullRequest],
+    students_config: StudentsConfig,
+    result: AnalysisResult,
+) -> None:
     """
     Post or update a participation classification comment on a specific PR.
 
@@ -2112,7 +2165,10 @@ def _annotate_pr(repo: Repo, pr_number: int, pull_requests: list[PullRequest]) -
     else:
         classification = "**solo** work (no commits with co-authors)"
 
-    lines = [f"**datool participation:** This PR is classified as {classification}.", ""]
+    lines = [
+        f"**datool participation:** This PR is classified as {classification}.",
+        "",
+    ]
     lines.append("| Commit | Collaborators | Message |")
     lines.append("|--------|---------------|---------|")
     for commit in pr.commits:
@@ -2120,6 +2176,53 @@ def _annotate_pr(repo: Repo, pr_number: int, pull_requests: list[PullRequest]) -
         collaborators = ", ".join(commit.co_authors) if commit.co_authors else "—"
         msg = commit.message.splitlines()[0][:40] if commit.message else ""
         lines.append(f"| `{short_hash}` | {collaborators} | {msg} |")
+
+    # Add full student stats table
+    has_gh = result.github_stats is not None
+
+    def fmt_pr(merged: int, unmerged: int) -> str:
+        if unmerged > 0:
+            return f"{merged}({unmerged})"
+        return str(merged)
+
+    lines.append("")
+    lines.append("<details>")
+    lines.append("<summary><strong>Student summary</strong></summary>")
+    lines.append("")
+    lines.append(
+        "> C=Commits, L=Lines, Alone=without co-authors, Collab=with co-authors"
+    )
+    lines.append("")
+    if has_gh:
+        lines.append(
+            "| ID | Name | PR.Alone | PR.Collab | PR.Appr | C.Alone | C.Collab | L.Alone | L.Collab |"
+        )
+        lines.append(
+            "|---:|------|----------|-----------|---------|---------|----------|---------|----------|"
+        )
+    else:
+        lines.append("| ID | Name | C.Alone | C.Collab | L.Alone | L.Collab |")
+        lines.append("|---:|------|---------|----------|---------|----------|")
+
+    for student in students_config.students:
+        total_alone = sum(len(l) for l in result.alone_lines[student].values())
+        total_collab = sum(len(l) for l in result.collab_lines[student].values())
+        c_alone = len(result.alone_commits[student])
+        c_collab = len(result.collab_commits[student])
+        if has_gh and result.github_stats:
+            gh = result.github_stats[student]
+            pr_alone = fmt_pr(gh.prs_alone_merged, gh.prs_alone_open)
+            pr_collab = fmt_pr(gh.prs_collab_merged, gh.prs_collab_open)
+            lines.append(
+                f"| {student.student_id} | {student.name} | {pr_alone} | {pr_collab} | {gh.approvals_given} | {c_alone} | {c_collab} | {total_alone} | {total_collab} |"
+            )
+        else:
+            lines.append(
+                f"| {student.student_id} | {student.name} | {c_alone} | {c_collab} | {total_alone} | {total_collab} |"
+            )
+
+    lines.append("")
+    lines.append("</details>")
 
     body = "\n".join(lines)
 
@@ -2263,6 +2366,7 @@ def main() -> None:
     load_cache()
     setup_cache_handlers()
 
+    repo: Repo | None = None
     try:
         repo = Repo(args.repo)
         students_config = repo.get_students_config()
@@ -2306,7 +2410,7 @@ def main() -> None:
 
         if args.annotate_pr:
             pull_requests = repo.get_pull_requests()
-            _annotate_pr(repo, args.annotate_pr, pull_requests)
+            _annotate_pr(repo, args.annotate_pr, pull_requests, students_config, result)
 
     except (
         ValueError,
@@ -2318,6 +2422,8 @@ def main() -> None:
         GitHubApiError,
     ) as e:
         print(f"Error: {e}", file=sys.stderr)
+        if args.annotate_pr and repo is not None:
+            _post_error_to_pr(repo, args.annotate_pr, str(e))
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         stderr = (
