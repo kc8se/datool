@@ -104,8 +104,9 @@ class UnknownAuthorError(Exception):
         self.context_type = context_type
         self.context_detail = context_detail
         super().__init__(
-            f"Unknown author '{name} <{email}>' not in student config. "
-            f"Found in {context_type}: {context_detail}"
+            f"Unknown author '{name} <{email}>' found in {context_type} {context_detail}. "
+            f"Add '{name}' to other_names and '{email}' to other_emails "
+            f"for the matching student in .students.json."
         )
 
 
@@ -519,7 +520,7 @@ class Commit:
         )
 
     def get_co_authors(self) -> list[Author]:
-        """
+        r"""
         Parse Co-authored-by trailers from the commit message.
 
         Follows GitHub's format for commits with multiple authors:
@@ -614,7 +615,7 @@ class TrackedFile:
         Yields:
             TrackedFile instances for each matching file
         """
-        # Get list of files matching the pattern at the given commit
+        # Get list of files tracked by git at this commit
         stdout = git(
             "-C",
             str(repo.path),
@@ -624,13 +625,19 @@ class TrackedFile:
             commit,
             cache_key=f"ls-tree:{repo.repo_id}:{commit}",
         )
+        tracked_files = set(stdout.splitlines())
 
-        # Filter files matching the glob pattern
-        from fnmatch import fnmatch
+        # Use Python's Path.glob() for correct cross-platform ** handling,
+        # then intersect with tracked files so untracked files are excluded.
+        from pathlib import Path
 
-        for file_path in stdout.splitlines():
-            if fnmatch(file_path, pattern):
-                yield TrackedFile.get(file_path, repo, commit)
+        repo_path = Path(repo.path)
+        for matched in repo_path.glob(pattern):
+            if not matched.is_file():
+                continue
+            rel_path = matched.relative_to(repo_path).as_posix()
+            if rel_path in tracked_files:
+                yield TrackedFile.get(rel_path, repo, commit)
 
     @staticmethod
     def get(file_path: str, repo: "Repo", commit: str = "HEAD") -> "TrackedFile":
@@ -1021,7 +1028,7 @@ class Repo:
                 with open(config_file, "r", encoding="utf-8") as f:
                     data: dict[str, Any] = json.load(f)
 
-                if data.get("id") == magic_id:
+                if isinstance(data, dict) and data.get("id") == magic_id:
                     # Found it, cache the path
                     self._students_config_path = str(config_file.relative_to(self.path))
                     return data
@@ -1047,7 +1054,7 @@ class Repo:
                 with open(config_file, "r", encoding="utf-8") as f:
                     data2: dict[str, Any] = json.load(f)
 
-                if data2.get("id") == magic_id:
+                if isinstance(data2, dict) and data2.get("id") == magic_id:
                     # Found it, cache the path
                     self._students_config_path = str(config_file.relative_to(self.path))
                     return data2
@@ -1153,7 +1160,6 @@ class Repo:
                 subprocess.CalledProcessError,
                 IndexError,
                 ValueError,
-                UnknownAuthorError,
             ):
                 # Commit not found in local git — skip it to keep output consistent
                 print(
@@ -1625,12 +1631,18 @@ def _collect_github_stats(
         for pattern in include_patterns:
             if fnmatch(file_path, pattern):
                 return True
+            # "**/" prefix should also match root-level files (Path.glob behaviour)
+            if pattern.startswith("**/") and fnmatch(file_path, pattern[3:]):
+                return True
         return False
 
     # Helper to check if a file should be excluded
     def should_exclude(file_path: str) -> bool:
         for pattern in exclude_patterns:
             if fnmatch(file_path, pattern):
+                return True
+            # "**/" prefix should also match root-level files (Path.glob behaviour)
+            if pattern.startswith("**/") and fnmatch(file_path, pattern[3:]):
                 return True
         return False
 
@@ -1789,7 +1801,7 @@ def _collect_commit_stats(
     for commit_hash in all_commits:
         try:
             commit = repo.get_commit(commit_hash)
-        except (CommitNotFoundError, UnknownAuthorError):
+        except CommitNotFoundError:
             continue
 
         if commit.author in ignored_authors:
