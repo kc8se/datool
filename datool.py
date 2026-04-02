@@ -619,6 +619,8 @@ class TrackedFile:
         stdout = git(
             "-C",
             str(repo.path),
+            "-c",
+            "core.quotePath=false",
             "ls-tree",
             "-r",
             "--name-only",
@@ -2217,8 +2219,12 @@ def _annotate_pr(
         lines.append("|---:|------|---------|----------|---------|----------|")
 
     for student in students_config.students:
-        total_alone = sum(len(l) for l in result.alone_lines[student].values())
-        total_collab = sum(len(l) for l in result.collab_lines[student].values())
+        total_alone = sum(
+            len(lines_) for lines_ in result.alone_lines[student].values()
+        )
+        total_collab = sum(
+            len(lines_) for lines_ in result.collab_lines[student].values()
+        )
         c_alone = len(result.alone_commits[student])
         c_collab = len(result.collab_commits[student])
         if has_gh and result.github_stats:
@@ -2239,12 +2245,12 @@ def _annotate_pr(
     body = "\n".join(lines)
 
     # Try to edit the last comment to avoid duplicates on repeated runs
-    result = subprocess.run(
+    proc = subprocess.run(
         [gh_path, "pr", "comment", str(pr_number), "--edit-last", "--body", body],
         cwd=repo.path,
         capture_output=True,
     )
-    if result.returncode != 0:
+    if proc.returncode != 0:
         # No existing comment by this user — create a new one
         subprocess.run(
             [gh_path, "pr", "comment", str(pr_number), "--body", body],
